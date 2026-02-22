@@ -1,0 +1,339 @@
+{
+  "name": "CyLive Hype Clipper",
+  "nodes": [
+    {
+      "parameters": {
+        "operation": "subscribe",
+        "channel": "chat:messages:*"
+      },
+      "id": "chat-subscriber",
+      "name": "Chat Subscriber",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse chat message for velocity tracking\nconst message = $input.first().json;\nconst streamId = message.streamId || message.channel?.split(':')[2];\n\nreturn [{\n  json: {\n    streamId: streamId,\n    userId: message.userId,\n    message: message.text || message.message,\n    emotes: message.emotes || [],\n    timestamp: Date.now(),\n    velocityWindow: 10 // seconds\n  }\n}];"
+      },
+      "id": "parse-message",
+      "name": "Parse Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "operation": "incr",
+        "key": "={{ 'chat:velocity:' + $json.streamId + ':' + Math.floor($json.timestamp / 10000) }}"
+      },
+      "id": "increment-velocity",
+      "name": "Increment Velocity Counter",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "expire",
+        "key": "={{ 'chat:velocity:' + $json.streamId + ':' + Math.floor($json.timestamp / 10000) }}",
+        "expire": true,
+        "ttl": 60
+      },
+      "id": "set-velocity-ttl",
+      "name": "Set Velocity TTL",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [850, 300],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "={{ 'chat:velocity:' + $json.streamId + ':' + Math.floor($json.timestamp / 10000) }}"
+      },
+      "id": "get-velocity",
+      "name": "Get Current Velocity",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1050, 300],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Detect hype moment\nconst data = $input.first().json;\nconst velocity = parseInt($input.first().json.velocity || 0);\n\n// Hype thresholds\nconst HYPER_THRESHOLD = 50;  // messages per 10 seconds\nconst SUPER_HYPE_THRESHOLD = 100;\nconst MEGA_HYPE_THRESHOLD = 200;\n\nlet hypeLevel = 'normal';\nlet shouldClip = false;\n\nif (velocity >= MEGA_HYPE_THRESHOLD) {\n  hypeLevel = 'mega';\n  shouldClip = true;\n} else if (velocity >= SUPER_HYPE_THRESHOLD) {\n  hypeLevel = 'super';\n  shouldClip = true;\n} else if (velocity >= HYPER_THRESHOLD) {\n  hypeLevel = 'hyper';\n  shouldClip = true;\n}\n\n// Check if we're already clipping this stream\nconst clippingKey = 'clip:active:' + data.streamId;\n\nreturn [{\n  json: {\n    ...data,\n    velocity: velocity,\n    hypeLevel: hypeLevel,\n    shouldClip: shouldClip,\n    messagesPerSecond: Math.round(velocity / 10 * 10) / 10,\n    timestamp: Date.now()\n  }\n}];"
+      },
+      "id": "detect-hype",
+      "name": "Detect Hype Moment",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1250, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "should-clip",
+              "leftValue": "={{ $json.shouldClip }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "clip-router",
+      "name": "Clip Router",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1450, 300]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "={{ 'clip:active:' + $json.streamId }}"
+      },
+      "id": "check-clipping",
+      "name": "Check Active Clipping",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1650, 200],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Check if already clipping\nconst isClipping = $input.first().json !== null;\n\nif (isClipping) {\n  return [{\n    json: {\n      ...$input.first().json,\n      skipClip: true,\n      reason: 'Already clipping this stream'\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    ...$input.first().json,\n    skipClip: false\n  }\n}];"
+      },
+      "id": "check-skip",
+      "name": "Check Skip Clip",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1850, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare FFmpeg recording command\nconst data = $input.first().json;\n\nconst clipId = crypto.randomUUID();\nconst startTime = Date.now();\nconst streamUrl = `rtmp://mediamtx:1935/live/${data.streamId}`;\nconst outputPath = `/clips/${data.streamId}/${clipId}.mp4`;\nconst duration = 30; // Clip duration in seconds\n\n// FFmpeg command for capturing clip\nconst ffmpegCommand = `ffmpeg -i ${streamUrl} -t ${duration} -c copy -f mp4 ${outputPath}`;\n\nreturn [{\n  json: {\n    ...data,\n    clipId: clipId,\n    streamUrl: streamUrl,\n    outputPath: outputPath,\n    duration: duration,\n    ffmpegCommand: ffmpegCommand,\n    startTime: startTime,\n    estimatedEndTime: startTime + (duration * 1000)\n  }\n}];"
+      },
+      "id": "prepare-clip",
+      "name": "Prepare Clip Recording",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1650, 400]
+    },
+    {
+      "parameters": {
+        "command": "={{ $json.ffmpegCommand }}",
+        "cwd": "/clips"
+      },
+      "id": "execute-ffmpeg",
+      "name": "Execute FFmpeg",
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [1850, 400],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "={{ 'clip:active:' + $json.streamId }}",
+        "value": "={{ $json.clipId }}",
+        "expire": true,
+        "ttl": 45
+      },
+      "id": "mark-clipping",
+      "name": "Mark Clipping Active",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2050, 400],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "hype_clips",
+        "columns": "clip_id, stream_id, hype_level, velocity, start_time, end_time, duration, file_path, file_size, status, created_at",
+        "values": "={{ $json.clipId }}, {{ $json.streamId }}, {{ $json.hypeLevel }}, {{ $json.velocity }}, {{ new Date($json.startTime).toISOString() }}, {{ new Date($json.estimatedEndTime).toISOString() }}, {{ $json.duration }}, {{ $json.outputPath }}, 0, 'recording', {{ new Date().toISOString() }}"
+      },
+      "id": "log-clip-start",
+      "name": "Log Clip Start",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [2050, 200],
+      "credentials": {
+        "postgres": "cylive-postgres-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "publish",
+        "channel": "={{ 'clips:hype:' + $json.streamId }}",
+        "message": "={{ JSON.stringify({\n  type: 'clip_started',\n  clipId: $json.clipId,\n  streamId: $json.streamId,\n  hypeLevel: $json.hypeLevel,\n  velocity: $json.velocity,\n  duration: $json.duration,\n  timestamp: Date.now()\n}) }}"
+      },
+      "id": "broadcast-clip",
+      "name": "Broadcast Clip Event",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2250, 400],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Wait for clip to finish then process\nconst data = $input.first().json;\nconst waitTime = data.duration * 1000;\n\nreturn new Promise(resolve => {\n  setTimeout(() => {\n    resolve([{\n      json: {\n        ...data,\n        completedAt: Date.now(),\n        status: 'completed'\n      }\n    }]);\n  }, waitTime);\n});"
+      },
+      "id": "wait-completion",
+      "name": "Wait for Completion",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [2450, 400]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "table": "hype_clips",
+        "updateKey": "clip_id",
+        "updateKeyValue": "={{ $json.clipId }}",
+        "columns": "status, file_size, completed_at",
+        "values": "completed, {{ $json.fileSize || 0 }}, {{ new Date().toISOString() }}"
+      },
+      "id": "update-clip-complete",
+      "name": "Update Clip Complete",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [2650, 400],
+      "credentials": {
+        "postgres": "cylive-postgres-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "publish",
+        "channel": "={{ 'clips:hype:' + $json.streamId }}",
+        "message": "={{ JSON.stringify({\n  type: 'clip_completed',\n  clipId: $json.clipId,\n  streamId: $json.streamId,\n  filePath: $json.outputPath,\n  timestamp: Date.now()\n}) }}"
+      },
+      "id": "broadcast-complete",
+      "name": "Broadcast Completion",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2850, 400],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    }
+  ],
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "error-handler-workflow",
+    "saveManualExecutions": true
+  },
+  "tags": ["clips", "hype", "ffmpeg", "recording"],
+  "connections": {
+    "Chat Subscriber": {
+      "main": [[{"node": "Parse Message", "type": "main", "index": 0}]]
+    },
+    "Parse Message": {
+      "main": [[{"node": "Increment Velocity Counter", "type": "main", "index": 0}]]
+    },
+    "Increment Velocity Counter": {
+      "main": [[{"node": "Set Velocity TTL", "type": "main", "index": 0}]]
+    },
+    "Set Velocity TTL": {
+      "main": [[{"node": "Get Current Velocity", "type": "main", "index": 0}]]
+    },
+    "Get Current Velocity": {
+      "main": [[{"node": "Detect Hype Moment", "type": "main", "index": 0}]]
+    },
+    "Detect Hype Moment": {
+      "main": [[{"node": "Clip Router", "type": "main", "index": 0}]]
+    },
+    "Clip Router": {
+      "main": [
+        [{"node": "Check Active Clipping", "type": "main", "index": 0}],
+        []
+      ]
+    },
+    "Check Active Clipping": {
+      "main": [[{"node": "Check Skip Clip", "type": "main", "index": 0}]]
+    },
+    "Check Skip Clip": {
+      "main": [
+        [{"node": "Prepare Clip Recording", "type": "main", "index": 0}],
+        []
+      ]
+    },
+    "Prepare Clip Recording": {
+      "main": [[{"node": "Execute FFmpeg", "type": "main", "index": 0}]]
+    },
+    "Execute FFmpeg": {
+      "main": [
+        [{"node": "Mark Clipping Active", "type": "main", "index": 0}],
+        [{"node": "Log Clip Start", "type": "main", "index": 0}]
+      ]
+    },
+    "Mark Clipping Active": {
+      "main": [[{"node": "Broadcast Clip Event", "type": "main", "index": 0}]]
+    },
+    "Broadcast Clip Event": {
+      "main": [[{"node": "Wait for Completion", "type": "main", "index": 0}]]
+    },
+    "Wait for Completion": {
+      "main": [[{"node": "Update Clip Complete", "type": "main", "index": 0}]]
+    },
+    "Update Clip Complete": {
+      "main": [[{"node": "Broadcast Completion", "type": "main", "index": 0}]]
+    }
+  },
+  "mcpTools": {
+    "detect_hype": {
+      "name": "cylive_detect_hype_moment",
+      "description": "Detect high-velocity chat moments and auto-generate clips",
+      "parameters": {
+        "streamId": { "type": "string", "required": true },
+        "velocity": { "type": "number", "description": "Current chat velocity (msgs/sec)" },
+        "hypeLevel": { "type": "string", "enum": ["normal", "hyper", "super", "mega"] }
+      }
+    },
+    "start_clip": {
+      "name": "cylive_start_clip_recording",
+      "description": "Manually start recording a hype clip",
+      "parameters": {
+        "streamId": { "type": "string", "required": true },
+        "duration": { "type": "number", "default": 30, "description": "Clip duration in seconds" }
+      }
+    },
+    "get_clip_status": {
+      "name": "cylive_get_clip_status",
+      "description": "Get status of hype clips for a stream",
+      "parameters": {
+        "streamId": { "type": "string", "required": true }
+      }
+    }
+  },
+  "createdAt": "2026-02-11T00:00:00.000Z",
+  "updatedAt": "2026-02-11T00:00:00.000Z"
+}

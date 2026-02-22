@@ -1,0 +1,389 @@
+{
+  "name": "CyLive AI Assistant - Whisper + Claude",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "ai-assistant",
+        "responseMode": "responseNode",
+        "httpMethod": "POST"
+      },
+      "id": "assistant-webhook",
+      "name": "Assistant Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "ai-assistant-endpoint"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse AI assistant request\nconst body = $input.first().json.body || $input.first().json;\n\nconst validActions = ['transcribe', 'summarize', 'answer', 'analyze_sentiment', 'moderate', 'suggest_tags'];\nconst action = body.action;\n\nif (!validActions.includes(action)) {\n  throw new Error('Invalid assistant action: ' + action);\n}\n\nreturn [{\n  json: {\n    action: action,\n    streamId: body.streamId,\n    userId: body.userId,\n    text: body.text,\n    audioUrl: body.audioUrl,\n    audioBase64: body.audioBase64,\n    context: body.context || {},\n    question: body.question,\n    language: body.language || 'en',\n    timestamp: new Date().toISOString(),\n    requestId: crypto.randomUUID()\n  }\n}];"
+      },
+      "id": "parse-request",
+      "name": "Parse Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "table": "ai_usage_logs",
+        "returnAll": false,
+        "limit": 1,
+        "where": {
+          "conditions": [
+            {
+              "column": "user_id",
+              "value": "={{ $json.userId }}",
+              "condition": "equal"
+            }
+          ]
+        },
+        "options": {
+          "sort": {
+            "properties": [
+              {
+                "name": "created_at",
+                "direction": "DESC"
+              }
+            ]
+          }
+        }
+      },
+      "id": "check-rate-limit",
+      "name": "Check Rate Limit",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [650, 300],
+      "credentials": {
+        "postgres": "cylive-postgres-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Check rate limiting\nconst data = $input.first().json;\nconst lastRequest = $input.first().json.rateLimitCheck;\n\nconst RATE_LIMIT_WINDOW = 60000; // 1 minute\nconst MAX_REQUESTS = 60; // per minute\n\nif (lastRequest && lastRequest.length > 0) {\n  const lastTime = new Date(lastRequest[0].created_at).getTime();\n  const now = Date.now();\n  \n  if (now - lastTime < RATE_LIMIT_WINDOW / MAX_REQUESTS) {\n    return [{\n      json: {\n        ...data,\n        error: 'Rate limit exceeded. Please wait before making another request.',\n        errorCode: 'RATE_LIMITED',\n        retryAfter: Math.ceil((RATE_LIMIT_WINDOW / MAX_REQUESTS - (now - lastTime)) / 1000)\n      }\n    }];\n  }\n}\n\nreturn [{\n  json: data\n}];"
+      },
+      "id": "rate-limit-check",
+      "name": "Rate Limit Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "has-error",
+              "leftValue": "={{ $json.error }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "isNotEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "error-router",
+      "name": "Error Router",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1050, 300]
+    },
+    {
+      "parameters": {
+        "operation": "switch",
+        "mode": "expression",
+        "rules": {
+          "rules": [
+            {
+              "value": "transcribe",
+              "output": 0
+            },
+            {
+              "value": "summarize",
+              "output": 1
+            },
+            {
+              "value": "answer",
+              "output": 2
+            },
+            {
+              "value": "analyze_sentiment",
+              "output": 3
+            }
+          ]
+        }
+      },
+      "id": "action-switch",
+      "name": "Action Switch",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 2,
+      "position": [1250, 500]
+    },
+    {
+      "parameters": {
+        "operation": "transcription",
+        "model": "whisper-1",
+        "file": "={{ $json.audioBase64 ? { data: $json.audioBase64, mimeType: 'audio/webm' } : undefined }}",
+        "options": {
+          "language": "={{ $json.language }}",
+          "response_format": "json"
+        }
+      },
+      "id": "whisper-transcribe",
+      "name": "Whisper Transcription",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [1450, 300],
+      "credentials": {
+        "openAiApi": "cylive-openai-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "model": "claude-3-5-sonnet-20241022",
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are a helpful AI assistant for a live streaming platform. Summarize the following stream transcript concisely, highlighting key moments and topics discussed. Keep the summary under 200 words."
+          },
+          {
+            "role": "user",
+            "content": "={{ $json.text }}"
+          }
+        ],
+        "options": {
+          "max_tokens": 300,
+          "temperature": 0.7
+        }
+      },
+      "id": "claude-summarize",
+      "name": "Claude Summarization",
+      "type": "@anthropic-ai/anthropic",
+      "typeVersion": 1,
+      "position": [1450, 500],
+      "credentials": {
+        "anthropicApi": "cylive-anthropic-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "model": "claude-3-5-sonnet-20241022",
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are a helpful AI assistant for a live streaming platform. Answer the user's question based on the provided context. Be concise and helpful."
+          },
+          {
+            "role": "user",
+            "content": "Context: {{ JSON.stringify($json.context) }}\n\nQuestion: {{ $json.question }}"
+          }
+        ],
+        "options": {
+          "max_tokens": 500,
+          "temperature": 0.7
+        }
+      },
+      "id": "claude-answer",
+      "name": "Claude Q&A",
+      "type": "@anthropic-ai/anthropic",
+      "typeVersion": 1,
+      "position": [1450, 700],
+      "credentials": {
+        "anthropicApi": "cylive-anthropic-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "model": "claude-3-5-sonnet-20241022",
+        "messages": [
+          {
+            "role": "system",
+            "content": "Analyze the sentiment of the following text. Respond with a JSON object containing: sentiment (positive/negative/neutral), confidence (0-1), and key_emotions (array of emotions)."
+          },
+          {
+            "role": "user",
+            "content": "={{ $json.text }}"
+          }
+        ],
+        "options": {
+          "max_tokens": 200,
+          "temperature": 0.3
+        }
+      },
+      "id": "claude-sentiment",
+      "name": "Claude Sentiment Analysis",
+      "type": "@anthropic-ai/anthropic",
+      "typeVersion": 1,
+      "position": [1450, 900],
+      "credentials": {
+        "anthropicApi": "cylive-anthropic-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process AI response\nconst data = $input.first().json;\nconst aiResponse = $input.first().json.aiResponse;\n\nlet result = {\n  success: true,\n  requestId: data.requestId,\n  action: data.action,\n  timestamp: new Date().toISOString()\n};\n\nswitch (data.action) {\n  case 'transcribe':\n    result.data = {\n      transcription: aiResponse.text || aiResponse.transcription,\n      language: aiResponse.language || data.language,\n      duration: aiResponse.duration\n    };\n    break;\n    \n  case 'summarize':\n    result.data = {\n      summary: aiResponse.content || aiResponse.text,\n      originalLength: data.text?.length || 0,\n      summaryLength: (aiResponse.content || aiResponse.text)?.length || 0\n    };\n    break;\n    \n  case 'answer':\n    result.data = {\n      answer: aiResponse.content || aiResponse.text,\n      question: data.question\n    };\n    break;\n    \n  case 'analyze_sentiment':\n    try {\n      const sentimentData = JSON.parse(aiResponse.content || aiResponse.text);\n      result.data = sentimentData;\n    } catch (e) {\n      result.data = {\n        sentiment: 'neutral',\n        confidence: 0.5,\n        key_emotions: [],\n        raw_response: aiResponse.content || aiResponse.text\n      };\n    }\n    break;\n}\n\nreturn [{\n  json: result\n}];"
+      },
+      "id": "process-response",
+      "name": "Process AI Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1650, 500]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "ai_usage_logs",
+        "columns": "request_id, user_id, stream_id, action, input_length, output_length, model_used, tokens_used, cost, latency_ms, created_at",
+        "values": "={{ $json.requestId }}, {{ $input.first().json.userId }}, {{ $input.first().json.streamId }}, {{ $input.first().json.action }}, {{ ($input.first().json.text || '').length }}, {{ JSON.stringify($json.data).length }}, 'claude-3.5-sonnet', 0, 0, 0, {{ new Date().toISOString() }}"
+      },
+      "id": "log-usage",
+      "name": "Log AI Usage",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1850, 500],
+      "credentials": {
+        "postgres": "cylive-postgres-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "publish",
+        "channel": "={{ 'ai:assistant:' + $input.first().json.streamId }}",
+        "message": "={{ JSON.stringify({\n  type: 'ai_response',\n  requestId: $json.requestId,\n  action: $json.action,\n  data: $json.data,\n  timestamp: Date.now()\n}) }}"
+      },
+      "id": "publish-response",
+      "name": "Publish Response",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2050, 500],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}"
+      },
+      "id": "assistant-response",
+      "name": "Assistant Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2250, 500]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({\n  \"success\": false,\n  \"error\": $json.error,\n  \"errorCode\": $json.errorCode,\n  \"retryAfter\": $json.retryAfter\n}) }}",
+        "options": {
+          "responseCode": 429
+        }
+      },
+      "id": "rate-limit-response",
+      "name": "Rate Limit Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1250, 100]
+    }
+  ],
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "error-handler-workflow"
+  },
+  "tags": ["ai", "assistant", "whisper", "claude", "transcription"],
+  "connections": {
+    "Assistant Webhook": {
+      "main": [[{"node": "Parse Request", "type": "main", "index": 0}]]
+    },
+    "Parse Request": {
+      "main": [[{"node": "Check Rate Limit", "type": "main", "index": 0}]]
+    },
+    "Check Rate Limit": {
+      "main": [[{"node": "Rate Limit Check", "type": "main", "index": 0}]]
+    },
+    "Rate Limit Check": {
+      "main": [[{"node": "Error Router", "type": "main", "index": 0}]]
+    },
+    "Error Router": {
+      "main": [
+        [{"node": "Rate Limit Response", "type": "main", "index": 0}],
+        [{"node": "Action Switch", "type": "main", "index": 0}]
+      ]
+    },
+    "Action Switch": {
+      "main": [
+        [{"node": "Whisper Transcription", "type": "main", "index": 0}],
+        [{"node": "Claude Summarization", "type": "main", "index": 0}],
+        [{"node": "Claude Q&A", "type": "main", "index": 0}],
+        [{"node": "Claude Sentiment Analysis", "type": "main", "index": 0}]
+      ]
+    },
+    "Whisper Transcription": {
+      "main": [[{"node": "Process AI Response", "type": "main", "index": 0}]]
+    },
+    "Claude Summarization": {
+      "main": [[{"node": "Process AI Response", "type": "main", "index": 0}]]
+    },
+    "Claude Q&A": {
+      "main": [[{"node": "Process AI Response", "type": "main", "index": 0}]]
+    },
+    "Claude Sentiment Analysis": {
+      "main": [[{"node": "Process AI Response", "type": "main", "index": 0}]]
+    },
+    "Process AI Response": {
+      "main": [[{"node": "Log AI Usage", "type": "main", "index": 0}]]
+    },
+    "Log AI Usage": {
+      "main": [[{"node": "Publish Response", "type": "main", "index": 0}]]
+    },
+    "Publish Response": {
+      "main": [[{"node": "Assistant Response", "type": "main", "index": 0}]]
+    }
+  },
+  "mcpTools": {
+    "transcribe_audio": {
+      "name": "cylive_transcribe_audio",
+      "description": "Transcribe audio using OpenAI Whisper",
+      "parameters": {
+        "audioBase64": { "type": "string", "description": "Base64-encoded audio data" },
+        "audioUrl": { "type": "string", "description": "URL to audio file" },
+        "language": { "type": "string", "default": "en" }
+      }
+    },
+    "summarize_text": {
+      "name": "cylive_summarize_text",
+      "description": "Summarize text using Claude 3.5 Sonnet",
+      "parameters": {
+        "text": { "type": "string", "required": true, "maxLength": 10000 },
+        "maxLength": { "type": "number", "default": 200 }
+      }
+    },
+    "ask_question": {
+      "name": "cylive_ask_ai",
+      "description": "Ask a question to Claude AI with context",
+      "parameters": {
+        "question": { "type": "string", "required": true },
+        "context": { "type": "object" }
+      }
+    },
+    "analyze_sentiment": {
+      "name": "cylive_analyze_sentiment",
+      "description": "Analyze sentiment of text using Claude",
+      "parameters": {
+        "text": { "type": "string", "required": true }
+      }
+    }
+  },
+  "createdAt": "2026-02-11T00:00:00.000Z",
+  "updatedAt": "2026-02-11T00:00:00.000Z"
+}

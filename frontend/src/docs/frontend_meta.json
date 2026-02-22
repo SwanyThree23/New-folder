@@ -1,0 +1,32 @@
+[
+    {
+        "type": "component",
+        "name": "VideoPlayer",
+        "description": "Video player component using hls.js for low-latency streaming playback.",
+        "props": [
+            "streamKey",
+            "isHost"
+        ]
+    },
+    {
+        "type": "service",
+        "name": "RoomService",
+        "description": "Service for creating and fetching rooms.",
+        "methods": [
+            "create",
+            "get"
+        ]
+    },
+    {
+        "type": "page",
+        "name": "Dashboard",
+        "description": "User protected dashboard with routing to go live or view wallet.",
+        "path": "/dashboard"
+    },
+    {
+        "type": "page",
+        "name": "Room",
+        "description": "Streaming room interface combining VideoPlayer, Chat, and real-time viewer count.",
+        "path": "/room/[id]"
+    }
+]

@@ -1,0 +1,282 @@
+{
+  "name": "CyLive AI Content Moderation",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "moderate",
+        "responseMode": "responseNode",
+        "httpMethod": "POST"
+      },
+      "id": "moderation-webhook",
+      "name": "Moderation Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "moderation-endpoint"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse moderation request\nconst body = $input.first().json.body || $input.first().json;\n\nconst contentTypes = ['chat', 'comment', 'username', 'stream_title', 'thumbnail'];\nconst contentType = body.contentType || 'chat';\n\nif (!contentTypes.includes(contentType)) {\n  throw new Error('Invalid content type');\n}\n\nreturn [{\n  json: {\n    content: body.content,\n    contentType: contentType,\n    userId: body.userId,\n    streamId: body.streamId,\n    timestamp: new Date().toISOString(),\n    requestId: crypto.randomUUID()\n  }\n}];"
+      },
+      "id": "parse-request",
+      "name": "Parse Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "model": "moderation-latest",
+        "text": "={{ $json.content }}"
+      },
+      "id": "openai-moderation",
+      "name": "OpenAI Moderation",
+      "type": "n8n-nodes-base.openAi",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "credentials": {
+        "openAiApi": "cylive-openai-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process moderation results\nconst moderationResult = $input.first().json;\nconst contentData = $input.first().json.contentData;\n\nconst categories = moderationResult.categories || {};\nconst scores = moderationResult.category_scores || {};\n\n// Calculate overall toxicity score\nconst toxicityScore = Math.max(\n  scores.hate || 0,\n  scores.hate_threatening || 0,\n  scores.harassment || 0,\n  scores.harassment_threatening || 0,\n  scores.self_harm || 0,\n  scores.sexual || 0,\n  scores.sexual_minors || 0,\n  scores.violence || 0,\n  scores.violence_graphic || 0\n);\n\n// Determine action based on thresholds\nlet action = 'allow';\nlet severity = 'none';\n\nif (toxicityScore > 0.9) {\n  action = 'block';\n  severity = 'critical';\n} else if (toxicityScore > 0.7) {\n  action = 'flag';\n  severity = 'high';\n} else if (toxicityScore > 0.4) {\n  action = 'warn';\n  severity = 'medium';\n} else if (Object.values(categories).some(v => v === true)) {\n  action = 'review';\n  severity = 'low';\n}\n\nreturn [{\n  json: {\n    ...contentData,\n    moderationResult: {\n      flagged: moderationResult.flagged,\n      categories: categories,\n      scores: scores,\n      toxicityScore: toxicityScore,\n      severity: severity,\n      action: action\n    },\n    processedAt: new Date().toISOString()\n  }\n}];"
+      },
+      "id": "process-moderation",
+      "name": "Process Moderation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "moderation_logs",
+        "columns": "request_id, user_id, stream_id, content_type, content_hash, toxicity_score, severity, action_taken, categories, processed_at",
+        "values": "={{ $json.requestId }}, {{ $json.userId }}, {{ $json.streamId }}, {{ $json.contentType }}, {{ $json.content.length > 0 ? require('crypto').createHash('sha256').update($json.content).digest('hex') : 'empty' }}, {{ $json.moderationResult.toxicityScore }}, {{ $json.moderationResult.severity }}, {{ $json.moderationResult.action }}, {{ JSON.stringify($json.moderationResult.categories) }}, {{ $json.processedAt }}"
+      },
+      "id": "log-moderation",
+      "name": "Log Moderation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1050, 300],
+      "credentials": {
+        "postgres": "cylive-postgres-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "action-check",
+              "leftValue": "={{ $json.moderationResult.action }}",
+              "rightValue": "block",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "action-router",
+      "name": "Action Router",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1250, 300]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "={{ 'moderation:user:' + $json.userId + ':strikes' }}",
+        "value": "={{ ($json.strikes || 0) + 1 }}",
+        "expire": false
+      },
+      "id": "increment-strikes",
+      "name": "Increment Strikes",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1450, 200],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "={{ 'moderation:user:' + $json.userId + ':strikes' }}"
+      },
+      "id": "get-strikes",
+      "name": "Get User Strikes",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1450, 100],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "user_violations",
+        "columns": "user_id, violation_type, severity, content_hash, stream_id, strike_count, action_taken, created_at",
+        "values": "={{ $json.userId }}, {{ $json.contentType }}, {{ $json.moderationResult.severity }}, {{ require('crypto').createHash('sha256').update($json.content).digest('hex') }}, {{ $json.streamId }}, {{ ($json.strikes || 0) + 1 }}, {{ $json.moderationResult.action }}, {{ new Date().toISOString() }}"
+      },
+      "id": "log-violation",
+      "name": "Log Violation",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1650, 200],
+      "credentials": {
+        "postgres": "cylive-postgres-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Check if user should be banned\nconst strikes = $input.first().json.strikes || 0;\nconst severity = $input.first().json.moderationResult.severity;\n\nlet shouldBan = false;\nlet banDuration = 0;\n\nif (severity === 'critical' || strikes >= 5) {\n  shouldBan = true;\n  banDuration = 86400 * 30; // 30 days\n} else if (strikes >= 3) {\n  shouldBan = true;\n  banDuration = 86400 * 7; // 7 days\n}\n\nreturn [{\n  json: {\n    ...$input.first().json,\n    shouldBan: shouldBan,\n    banDuration: banDuration,\n    banExpiresAt: shouldBan ? new Date(Date.now() + banDuration * 1000).toISOString() : null\n  }\n}];"
+      },
+      "id": "check-ban",
+      "name": "Check Ban Conditions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1650, 100]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "={{ 'banned:user:' + $json.userId }}",
+        "value": "={{ $json.banExpiresAt }}",
+        "expire": true,
+        "ttl": "={{ $json.banDuration }}"
+      },
+      "id": "ban-user",
+      "name": "Ban User",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1850, 100],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({\n  \"success\": true,\n  \"data\": {\n    \"allowed\": $json.moderationResult.action !== 'block',\n    \"action\": $json.moderationResult.action,\n    \"severity\": $json.moderationResult.severity,\n    \"toxicityScore\": $json.moderationResult.toxicityScore,\n    \"categories\": $json.moderationResult.categories,\n    \"requestId\": $json.requestId,\n    \"banned\": $json.shouldBan || false,\n    \"banDuration\": $json.banDuration || 0\n  }\n}) }}"
+      },
+      "id": "moderation-response",
+      "name": "Moderation Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2050, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Publish moderation event to Redis for real-time processing\nreturn [{\n  json: {\n    channel: 'moderation:events',\n    message: JSON.stringify({\n      type: 'content_moderated',\n      userId: $json.userId,\n      streamId: $json.streamId,\n      action: $json.moderationResult.action,\n      severity: $json.moderationResult.severity,\n      timestamp: new Date().toISOString()\n    })\n  }\n}];"
+      },
+      "id": "publish-event",
+      "name": "Publish Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1850, 400]
+    },
+    {
+      "parameters": {
+        "operation": "publish",
+        "channel": "={{ $json.channel }}",
+        "message": "={{ $json.message }}"
+      },
+      "id": "redis-publish",
+      "name": "Redis Publish",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [2050, 400],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    }
+  ],
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "error-handler-workflow"
+  },
+  "tags": ["moderation", "ai", "content-filter"],
+  "connections": {
+    "Moderation Webhook": {
+      "main": [[{"node": "Parse Request", "type": "main", "index": 0}]]
+    },
+    "Parse Request": {
+      "main": [[{"node": "OpenAI Moderation", "type": "main", "index": 0}]]
+    },
+    "OpenAI Moderation": {
+      "main": [[{"node": "Process Moderation", "type": "main", "index": 0}]]
+    },
+    "Process Moderation": {
+      "main": [[{"node": "Log Moderation", "type": "main", "index": 0}]]
+    },
+    "Log Moderation": {
+      "main": [[{"node": "Action Router", "type": "main", "index": 0}]]
+    },
+    "Action Router": {
+      "main": [
+        [{"node": "Get User Strikes", "type": "main", "index": 0}],
+        [{"node": "Publish Event", "type": "main", "index": 0}]
+      ]
+    },
+    "Get User Strikes": {
+      "main": [[{"node": "Check Ban Conditions", "type": "main", "index": 0}]]
+    },
+    "Check Ban Conditions": {
+      "main": [
+        [{"node": "Ban User", "type": "main", "index": 0}],
+        [{"node": "Increment Strikes", "type": "main", "index": 0}]
+      ]
+    },
+    "Ban User": {
+      "main": [[{"node": "Log Violation", "type": "main", "index": 0}]]
+    },
+    "Increment Strikes": {
+      "main": [[{"node": "Log Violation", "type": "main", "index": 0}]]
+    },
+    "Log Violation": {
+      "main": [[{"node": "Moderation Response", "type": "main", "index": 0}]]
+    },
+    "Publish Event": {
+      "main": [[{"node": "Redis Publish", "type": "main", "index": 0}]]
+    }
+  },
+  "mcpTools": {
+    "moderate_content": {
+      "name": "cylive_moderate_content",
+      "description": "Moderate user content using AI toxicity scoring",
+      "parameters": {
+        "content": { "type": "string", "required": true, "maxLength": 4000 },
+        "contentType": { "type": "string", "enum": ["chat", "comment", "username", "stream_title", "thumbnail"], "default": "chat" },
+        "userId": { "type": "string", "required": true },
+        "streamId": { "type": "string" }
+      },
+      "returns": {
+        "allowed": "boolean",
+        "action": "string",
+        "severity": "string",
+        "toxicityScore": "number"
+      }
+    },
+    "check_user_status": {
+      "name": "cylive_check_user_moderation_status",
+      "description": "Check user's moderation status and strike count",
+      "parameters": {
+        "userId": { "type": "string", "required": true }
+      }
+    }
+  },
+  "createdAt": "2026-02-11T00:00:00.000Z",
+  "updatedAt": "2026-02-11T00:00:00.000Z"
+}

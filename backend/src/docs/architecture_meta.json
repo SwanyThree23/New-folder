@@ -1,0 +1,65 @@
+[
+    {
+        "type": "class",
+        "name": "User",
+        "description": "User Mongoose Model for platform users and creators.",
+        "methods": [
+            "comparePassword"
+        ],
+        "properties": [
+            "username",
+            "email",
+            "passwordHash",
+            "roles",
+            "apiKeys",
+            "walletBalance"
+        ]
+    },
+    {
+        "type": "class",
+        "name": "Room",
+        "description": "Room Mongoose Model for streaming rooms.",
+        "properties": [
+            "id",
+            "host",
+            "title",
+            "panelists",
+            "dsc",
+            "viewerCount",
+            "isLive"
+        ]
+    },
+    {
+        "type": "class",
+        "name": "Transaction",
+        "description": "Transaction Mongoose Model for financial records.",
+        "properties": [
+            "fromUser",
+            "toUser",
+            "amount",
+            "split",
+            "status"
+        ]
+    },
+    {
+        "type": "service",
+        "name": "EncryptionService",
+        "description": "Service for encrypting/decrypting sensitive data (API keys, secrets).",
+        "methods": [
+            "encrypt",
+            "decrypt"
+        ]
+    },
+    {
+        "type": "service",
+        "name": "RedisService",
+        "description": "Service for interacting with Redis cache for room state and viewer counts.",
+        "methods": [
+            "setRoomMeta",
+            "addGuest",
+            "removeGuest",
+            "incrementViewer",
+            "decrementViewer"
+        ]
+    }
+]

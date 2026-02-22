@@ -1,0 +1,240 @@
+{
+  "name": "CyLive Auth Service",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "auth-webhook",
+      "name": "Auth Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "auth-endpoint",
+      "path": "auth",
+      "responseMode": "responseNode",
+      "httpMethod": "POST"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse auth request\nconst body = $input.first().json.body || $input.first().json;\nconst action = body.action;\n\nif (!['login', 'register', 'refresh', 'logout', 'validate'].includes(action)) {\n  throw new Error('Invalid auth action');\n}\n\nreturn {\n  json: {\n    action: action,\n    email: body.email,\n    password: body.password,\n    token: body.token,\n    refreshToken: body.refreshToken,\n    userId: body.userId,\n    timestamp: new Date().toISOString()\n  }\n};"
+      },
+      "id": "validate-request",
+      "name": "Validate Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "table": "users",
+        "returnAll": false,
+        "limit": 1,
+        "where": {
+          "conditions": [
+            {
+              "column": "email",
+              "value": "={{ $json.email }}",
+              "condition": "equal"
+            }
+          ]
+        }
+      },
+      "id": "get-user",
+      "name": "Get User",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [650, 300],
+      "credentials": {
+        "postgres": "cylive-postgres-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Route based on action\nconst action = $input.first().json.action;\nreturn [{\n  json: $input.first().json,\n  pairedItem: { item: 0 }\n}];"
+      },
+      "id": "action-router",
+      "name": "Action Router",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 2,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// JWT Token Generation\nconst jwt = require('jsonwebtoken');\nconst crypto = require('crypto');\n\nconst user = $input.first().json;\nconst JWT_SECRET = $env.JWT_SECRET || 'dev-secret-key-change-in-production';\nconst JWT_EXPIRY = '24h';\nconst REFRESH_EXPIRY = '7d';\n\nconst payload = {\n  userId: user.id,\n  email: user.email,\n  role: user.role || 'viewer',\n  iat: Math.floor(Date.now() / 1000)\n};\n\nconst token = jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRY });\nconst refreshToken = crypto.randomBytes(64).toString('hex');\n\n// Store refresh token hash in Redis for validation\nreturn [{\n  json: {\n    userId: user.id,\n    email: user.email,\n    role: user.role,\n    token: token,\n    refreshToken: refreshToken,\n    expiresIn: JWT_EXPIRY,\n    tokenType: 'Bearer'\n  }\n}];"
+      },
+      "id": "generate-jwt",
+      "name": "Generate JWT",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1050, 200]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "={{ 'refresh:' + $json.userId }}",
+        "value": "={{ $json.refreshToken }}",
+        "expire": true,
+        "ttl": 604800
+      },
+      "id": "store-refresh-token",
+      "name": "Store Refresh Token",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1250, 200],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "auth_sessions",
+        "columns": "user_id, token_hash, refresh_token_hash, ip_address, user_agent, expires_at",
+        "values": "={{ $json.userId }}, {{ $json.token.split('.')[2] }}, {{ $json.refreshToken }}, {{ $input.first().json.ip || 'unknown' }}, {{ $input.first().json.userAgent || 'unknown' }}, {{ new Date(Date.now() + 24*60*60*1000).toISOString() }}"
+      },
+      "id": "log-session",
+      "name": "Log Session",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1450, 200],
+      "credentials": {
+        "postgres": "cylive-postgres-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({\n  \"success\": true,\n  \"data\": {\n    \"userId\": $json.userId,\n    \"email\": $json.email,\n    \"role\": $json.role,\n    \"accessToken\": $json.token,\n    \"refreshToken\": $json.refreshToken,\n    \"expiresIn\": 86400\n  }\n}) }}"
+      },
+      "id": "success-response",
+      "name": "Success Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1650, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({\n  \"success\": false,\n  \"error\": $json.error || 'Authentication failed',\n  \"code\": $json.errorCode || 'AUTH_ERROR'\n}) }}",
+        "options": {
+          "responseCode": 401
+        }
+      },
+      "id": "error-response",
+      "name": "Error Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1650, 500]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Password verification\nconst crypto = require('crypto');\n\nconst inputPassword = $input.first().json.password;\nconst storedHash = $input.first().json.password_hash;\nconst salt = $input.first().json.salt;\n\nif (!storedHash || !salt) {\n  throw new Error('Invalid credentials');\n}\n\nconst computedHash = crypto.pbkdf2Sync(inputPassword, salt, 100000, 64, 'sha512').toString('hex');\n\nif (computedHash !== storedHash) {\n  throw new Error('Invalid password');\n}\n\nreturn $input.all();"
+      },
+      "id": "verify-password",
+      "name": "Verify Password",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [850, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Register new user\nconst crypto = require('crypto');\n\nconst body = $input.first().json;\nconst salt = crypto.randomBytes(32).toString('hex');\nconst passwordHash = crypto.pbkdf2Sync(body.password, salt, 100000, 64, 'sha512').toString('hex');\n\nreturn [{\n  json: {\n    email: body.email,\n    password_hash: passwordHash,\n    salt: salt,\n    role: 'viewer',\n    created_at: new Date().toISOString(),\n    verified: false\n  }\n}];"
+      },
+      "id": "hash-password",
+      "name": "Hash Password",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1050, 400]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "users",
+        "columns": "email, password_hash, salt, role, created_at, verified",
+        "values": "={{ $json.email }}, {{ $json.password_hash }}, {{ $json.salt }}, {{ $json.role }}, {{ $json.created_at }}, {{ $json.verified }}",
+        "returnFields": ["id", "email", "role"]
+      },
+      "id": "create-user",
+      "name": "Create User",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1250, 400],
+      "credentials": {
+        "postgres": "cylive-postgres-credentials"
+      }
+    }
+  ],
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "error-handler-workflow"
+  },
+  "staticData": null,
+  "tags": ["authentication", "jwt", "auth"],
+  "connections": {
+    "Auth Webhook": {
+      "main": [[{"node": "Validate Request", "type": "main", "index": 0}]]
+    },
+    "Validate Request": {
+      "main": [[{"node": "Get User", "type": "main", "index": 0}]]
+    },
+    "Get User": {
+      "main": [
+        [{"node": "Verify Password", "type": "main", "index": 0}],
+        [{"node": "Hash Password", "type": "main", "index": 0}]
+      ]
+    },
+    "Verify Password": {
+      "main": [[{"node": "Generate JWT", "type": "main", "index": 0}]]
+    },
+    "Generate JWT": {
+      "main": [[{"node": "Store Refresh Token", "type": "main", "index": 0}]]
+    },
+    "Store Refresh Token": {
+      "main": [[{"node": "Log Session", "type": "main", "index": 0}]]
+    },
+    "Log Session": {
+      "main": [[{"node": "Success Response", "type": "main", "index": 0}]]
+    },
+    "Hash Password": {
+      "main": [[{"node": "Create User", "type": "main", "index": 0}]]
+    },
+    "Create User": {
+      "main": [[{"node": "Success Response", "type": "main", "index": 0}]]
+    }
+  },
+  "mcpTools": {
+    "auth": {
+      "name": "cylive_authenticate",
+      "description": "Authenticate user and generate JWT tokens",
+      "parameters": {
+        "action": {
+          "type": "string",
+          "enum": ["login", "register", "refresh", "logout", "validate"],
+          "required": true
+        },
+        "email": { "type": "string", "format": "email" },
+        "password": { "type": "string", "minLength": 8 },
+        "token": { "type": "string" },
+        "refreshToken": { "type": "string" }
+      }
+    },
+    "validate_token": {
+      "name": "cylive_validate_token",
+      "description": "Validate JWT token and return user info",
+      "parameters": {
+        "token": { "type": "string", "required": true }
+      }
+    },
+    "refresh_token": {
+      "name": "cylive_refresh_token",
+      "description": "Refresh access token using refresh token",
+      "parameters": {
+        "refreshToken": { "type": "string", "required": true },
+        "userId": { "type": "string", "required": true }
+      }
+    }
+  },
+  "createdAt": "2026-02-11T00:00:00.000Z",
+  "updatedAt": "2026-02-11T00:00:00.000Z"
+}

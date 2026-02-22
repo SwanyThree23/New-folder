@@ -1,0 +1,11 @@
+[
+    {
+        "type": "class",
+        "name": "ModerationService",
+        "description": "Service for screening user content.",
+        "methods": [
+            "screenContent",
+            "logEvent"
+        ]
+    }
+]

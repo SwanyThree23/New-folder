@@ -1,0 +1,336 @@
+{
+  "name": "CyLive Ledger - Atomic Transactions",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "ledger",
+        "responseMode": "responseNode",
+        "httpMethod": "POST"
+      },
+      "id": "ledger-webhook",
+      "name": "Ledger Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "ledger-endpoint"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse ledger transaction request\nconst body = $input.first().json.body || $input.first().json;\n\nconst validActions = ['deposit', 'withdraw', 'transfer', 'tip', 'subscription', 'split'];\nconst action = body.action;\n\nif (!validActions.includes(action)) {\n  throw new Error('Invalid ledger action: ' + action);\n}\n\n// Validate required fields\nif (!body.amount || body.amount <= 0) {\n  throw new Error('Invalid amount');\n}\n\nif (!body.currency) {\n  throw new Error('Currency required');\n}\n\nreturn [{\n  json: {\n    action: action,\n    amount: parseFloat(body.amount),\n    currency: body.currency.toUpperCase(),\n    fromUserId: body.fromUserId,\n    toUserId: body.toUserId,\n    streamId: body.streamId,\n    transactionId: body.transactionId || crypto.randomUUID(),\n    metadata: body.metadata || {},\n    timestamp: new Date().toISOString(),\n    idempotencyKey: body.idempotencyKey || crypto.randomUUID()\n  }\n}];"
+      },
+      "id": "parse-transaction",
+      "name": "Parse Transaction",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "table": "transactions",
+        "returnAll": false,
+        "limit": 1,
+        "where": {
+          "conditions": [
+            {
+              "column": "idempotency_key",
+              "value": "={{ $json.idempotencyKey }}",
+              "condition": "equal"
+            }
+          ]
+        }
+      },
+      "id": "check-duplicate",
+      "name": "Check Duplicate",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [650, 300],
+      "credentials": {
+        "postgres": "cylive-postgres-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "duplicate-check",
+              "leftValue": "={{ $json.length > 0 }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "duplicate-router",
+      "name": "Duplicate Router",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "table": "wallets",
+        "returnAll": false,
+        "limit": 1,
+        "where": {
+          "conditions": [
+            {
+              "column": "user_id",
+              "value": "={{ $json.fromUserId }}",
+              "condition": "equal"
+            },
+            {
+              "column": "currency",
+              "value": "={{ $json.currency }}",
+              "condition": "equal"
+            }
+          ]
+        }
+      },
+      "id": "get-source-wallet",
+      "name": "Get Source Wallet",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1050, 200],
+      "credentials": {
+        "postgres": "cylive-postgres-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "table": "wallets",
+        "returnAll": false,
+        "limit": 1,
+        "where": {
+          "conditions": [
+            {
+              "column": "user_id",
+              "value": "={{ $json.toUserId }}",
+              "condition": "equal"
+            },
+            {
+              "column": "currency",
+              "value": "={{ $json.currency }}",
+              "condition": "equal"
+            }
+          ]
+        }
+      },
+      "id": "get-dest-wallet",
+      "name": "Get Destination Wallet",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1050, 400],
+      "credentials": {
+        "postgres": "cylive-postgres-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Calculate 90/10 split\nconst transaction = $input.first().json;\nconst totalAmount = transaction.amount;\n\n// 90% to receiver, 10% platform fee\nconst platformFeeRate = 0.10;\nconst creatorRate = 0.90;\n\nconst platformFee = Math.floor(totalAmount * platformFeeRate * 100) / 100;\nconst creatorAmount = Math.floor((totalAmount - platformFee) * 100) / 100;\n\nreturn [{\n  json: {\n    ...transaction,\n    splits: {\n      creator: {\n        userId: transaction.toUserId,\n        amount: creatorAmount,\n        percentage: creatorRate * 100\n      },\n      platform: {\n        userId: 'platform',\n        amount: platformFee,\n        percentage: platformFeeRate * 100\n      }\n    },\n    totalAmount: totalAmount\n  }\n}];"
+      },
+      "id": "calculate-split",
+      "name": "Calculate 90/10 Split",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1250, 300]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "BEGIN TRANSACTION;\n\nUPDATE wallets SET balance = balance - {{ $json.splits.platform.amount }} WHERE user_id = '{{ $json.fromUserId }}' AND currency = '{{ $json.currency }}';\nUPDATE wallets SET balance = balance + {{ $json.splits.creator.amount }} WHERE user_id = '{{ $json.toUserId }}' AND currency = '{{ $json.currency }}';\nUPDATE wallets SET balance = balance + {{ $json.splits.platform.amount }} WHERE user_id = 'platform' AND currency = '{{ $json.currency }}';\n\nINSERT INTO transactions (id, idempotency_key, type, from_user_id, to_user_id, amount, currency, status, metadata, created_at) \nVALUES ('{{ $json.transactionId }}', '{{ $json.idempotencyKey }}', '{{ $json.action }}', '{{ $json.fromUserId }}', '{{ $json.toUserId }}', {{ $json.totalAmount }}, '{{ $json.currency }}', 'completed', '{{ JSON.stringify($json.metadata) }}', '{{ $json.timestamp }}');\n\nINSERT INTO transaction_splits (transaction_id, recipient_id, amount, percentage, recipient_type) VALUES\n('{{ $json.transactionId }}', '{{ $json.splits.creator.userId }}', {{ $json.splits.creator.amount }}, {{ $json.splits.creator.percentage }}, 'creator'),\n('{{ $json.transactionId }}', '{{ $json.splits.platform.userId }}', {{ $json.splits.platform.amount }}, {{ $json.splits.platform.percentage }}, 'platform');\n\nCOMMIT;"
+      },
+      "id": "atomic-transfer",
+      "name": "Atomic Transfer",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1450, 300],
+      "credentials": {
+        "postgres": "cylive-postgres-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "={{ 'ledger:transaction:' + $json.transactionId }}",
+        "value": "={{ JSON.stringify($json) }}",
+        "expire": true,
+        "ttl": 2592000
+      },
+      "id": "cache-transaction",
+      "name": "Cache Transaction",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1650, 300],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Update user balances in Redis\nreturn [\n  {\n    json: {\n      key: 'wallet:' + $json.fromUserId + ':' + $json.currency,\n      amount: -$json.totalAmount\n    }\n  },\n  {\n    json: {\n      key: 'wallet:' + $json.toUserId + ':' + $json.currency,\n      amount: $json.splits.creator.amount\n    }\n  }\n];"
+      },
+      "id": "balance-updates",
+      "name": "Balance Updates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1650, 100]
+    },
+    {
+      "parameters": {
+        "operation": "incrby",
+        "key": "={{ $json.key }}",
+        "increment": "={{ $json.amount * 100 }}"
+      },
+      "id": "update-redis-balance",
+      "name": "Update Redis Balance",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1850, 100],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "publish",
+        "channel": "ledger:transactions",
+        "message": "={{ JSON.stringify({\n  type: 'transaction_completed',\n  transactionId: $json.transactionId,\n  fromUserId: $json.fromUserId,\n  toUserId: $json.toUserId,\n  amount: $json.totalAmount,\n  currency: $json.currency,\n  splits: $json.splits,\n  timestamp: $json.timestamp\n}) }}"
+      },
+      "id": "publish-transaction",
+      "name": "Publish Transaction Event",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1850, 300],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({\n  \"success\": true,\n  \"data\": {\n    \"transactionId\": $json.transactionId,\n    \"status\": \"completed\",\n    \"amount\": $json.totalAmount,\n    \"currency\": $json.currency,\n    \"splits\": $json.splits,\n    \"timestamp\": $json.timestamp\n  }\n}) }}"
+      },
+      "id": "success-response",
+      "name": "Success Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2050, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({\n  \"success\": false,\n  \"error\": \"Duplicate transaction detected\",\n  \"code\": \"DUPLICATE_TRANSACTION\"\n}) }}",
+        "options": {
+          "responseCode": 409
+        }
+      },
+      "id": "duplicate-response",
+      "name": "Duplicate Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1050, 500]
+    }
+  ],
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "error-handler-workflow",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "tags": ["ledger", "transactions", "payments", "atomic"],
+  "connections": {
+    "Ledger Webhook": {
+      "main": [[{"node": "Parse Transaction", "type": "main", "index": 0}]]
+    },
+    "Parse Transaction": {
+      "main": [[{"node": "Check Duplicate", "type": "main", "index": 0}]]
+    },
+    "Check Duplicate": {
+      "main": [[{"node": "Duplicate Router", "type": "main", "index": 0}]]
+    },
+    "Duplicate Router": {
+      "main": [
+        [{"node": "Duplicate Response", "type": "main", "index": 0}],
+        [{"node": "Get Source Wallet", "type": "main", "index": 0}, {"node": "Get Destination Wallet", "type": "main", "index": 0}]
+      ]
+    },
+    "Get Source Wallet": {
+      "main": [[{"node": "Calculate 90/10 Split", "type": "main", "index": 0}]]
+    },
+    "Get Destination Wallet": {
+      "main": [[{"node": "Calculate 90/10 Split", "type": "main", "index": 0}]]
+    },
+    "Calculate 90/10 Split": {
+      "main": [[{"node": "Atomic Transfer", "type": "main", "index": 0}]]
+    },
+    "Atomic Transfer": {
+      "main": [[{"node": "Cache Transaction", "type": "main", "index": 0}]]
+    },
+    "Cache Transaction": {
+      "main": [
+        [{"node": "Balance Updates", "type": "main", "index": 0}],
+        [{"node": "Publish Transaction Event", "type": "main", "index": 0}]
+      ]
+    },
+    "Balance Updates": {
+      "main": [[{"node": "Update Redis Balance", "type": "main", "index": 0}]]
+    },
+    "Update Redis Balance": {
+      "main": [[{"node": "Success Response", "type": "main", "index": 0}]]
+    },
+    "Publish Transaction Event": {
+      "main": [[{"node": "Success Response", "type": "main", "index": 0}]]
+    }
+  },
+  "mcpTools": {
+    "create_transaction": {
+      "name": "cylive_create_transaction",
+      "description": "Create atomic 90/10 split transaction between users",
+      "parameters": {
+        "action": { "type": "string", "enum": ["deposit", "withdraw", "transfer", "tip", "subscription", "split"], "required": true },
+        "amount": { "type": "number", "minimum": 0.01, "required": true },
+        "currency": { "type": "string", "required": true },
+        "fromUserId": { "type": "string", "required": true },
+        "toUserId": { "type": "string", "required": true },
+        "idempotencyKey": { "type": "string", "description": "Unique key to prevent duplicate transactions" },
+        "metadata": { "type": "object" }
+      },
+      "returns": {
+        "transactionId": "string",
+        "status": "string",
+        "splits": "object"
+      }
+    },
+    "get_balance": {
+      "name": "cylive_get_balance",
+      "description": "Get user wallet balance",
+      "parameters": {
+        "userId": { "type": "string", "required": true },
+        "currency": { "type": "string", "required": true }
+      }
+    },
+    "get_transaction": {
+      "name": "cylive_get_transaction",
+      "description": "Retrieve transaction details by ID",
+      "parameters": {
+        "transactionId": { "type": "string", "required": true }
+      }
+    }
+  },
+  "createdAt": "2026-02-11T00:00:00.000Z",
+  "updatedAt": "2026-02-11T00:00:00.000Z"
+}

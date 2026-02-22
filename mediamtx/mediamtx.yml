@@ -1,0 +1,354 @@
+###############################################
+# cyLive MediaMTX Configuration
+# Streaming Platform: WebRTC, SRT, RTMP, HLS/DASH
+# Version: 1.0.0
+###############################################
+
+# =============================================
+# General Settings
+# =============================================
+logLevel: info
+logDestinations: [stdout, file]
+logFile: /var/log/mediamtx/mediamtx.log
+
+# =============================================
+# API Configuration (for orchestration)
+# =============================================
+api: yes
+apiAddress: :9997
+apiEncryption: no
+apiServerKey: ""
+apiServerCert: ""
+
+# =============================================
+# Metrics
+# =============================================
+metrics: yes
+metricsAddress: :9998
+metricsEncryption: no
+metricsServerKey: ""
+metricsServerCert: ""
+
+# =============================================
+# PPROF
+# =============================================
+pprof: no
+pprofAddress: :9999
+pprofEncryption: no
+
+# =============================================
+# RTSP Configuration
+# =============================================
+rtsp: yes
+rtspAddress: :8554
+rtspEncryption: no
+rtspServerKey: ""
+rtspServerCert: ""
+rtspAuthMethods: [basic, digest]
+rtspDisable: no
+
+# =============================================
+# RTMP Configuration (Backward Compatibility)
+# =============================================
+rtmp: yes
+rtmpAddress: :1935
+rtmpEncryption: no
+rtmpServerKey: ""
+rtmpServerCert: ""
+rtmpDisable: no
+
+# =============================================
+# HLS Configuration
+# =============================================
+hls: yes
+hlsAddress: :8888
+hlsEncryption: no
+hlsServerKey: ""
+hlsServerCert: ""
+hlsAlwaysRemux: no
+hlsVariant: fmp4
+hlsSegmentCount: 6
+hlsSegmentDuration: 2s
+hlsPartDuration: 500ms
+hlsSegmentMaxSize: 50M
+hlsAllowOrigin: '*'
+hlsEnable: yes
+
+# =============================================
+# DASH Configuration
+# =============================================
+dash: yes
+dashAddress: :8889
+dashEncryption: no
+dashServerKey: ""
+dashServerCert: ""
+dashAlwaysRemux: no
+dashSegmentCount: 6
+dashSegmentDuration: 2s
+dashAllowOrigin: '*'
+
+# =============================================
+# WebRTC Configuration (Ingestion & Playback)
+# =============================================
+webrtc: yes
+webrtcAddress: :8887
+webrtcEncryption: no
+webrtcServerKey: ""
+webrtcServerCert: ""
+webrtcLocalUDPAddress: :8189
+webrtcLocalTCPAddress: :8189
+webrtcIPsFromInterfaces: yes
+webrtcIPsFromInterfacesList: []
+webrtcAdditionalHosts: []
+webrtcICEServers: [stun:stun.l.google.com:19302]
+webrtcHandshakeTimeout: 10s
+webrtcTrackGatherTimeout: 2s
+webrtcAllowOrigin: '*'
+
+# =============================================
+# SRT Configuration
+# =============================================
+srt: yes
+srtAddress: :8890
+srtPassphrase: ""
+srtLatency: 20
+
+# =============================================
+# Authentication Hooks (N8n Integration)
+# =============================================
+authMethod: http
+authHTTPAddress: http://n8n:5678/webhook/mediamtx-auth
+authHTTPExclude: [api, metrics]
+authHTTPTimeout: 10s
+
+# =============================================
+# Global Settings
+# =============================================
+readTimeout: 10s
+writeTimeout: 10s
+readBufferCount: 512
+writeBufferCount: 512
+writeQueueSize: 512
+udpMaxPayloadSize: 1472
+externalAuthenticationURL: ""
+
+# =============================================
+# Recording Configuration
+# =============================================
+record: yes
+recordPath: /var/lib/mediamtx/recordings/%path/%Y-%m-%d_%H-%M-%S-%f
+recordFormat: fmp4
+recordPartDuration: 100ms
+recordSegmentDuration: 1h
+recordDeleteAfter: 720h  # 30 days retention
+
+# =============================================
+# Bandwidth & Connection Limits
+# =============================================
+maxConnections: 1000
+maxReadersPerPath: 50
+
+# =============================================
+# CORS Settings for Next.js Frontend
+# =============================================
+corsAllowOrigin: ['http://localhost:3000', 'http://frontend:3000', 'https://cylive.io', 'https://*.cylive.io', '*']
+corsAllowMethods: [GET, HEAD, OPTIONS, POST, PUT]
+corsAllowHeaders: [Authorization, Content-Type, X-Requested-With, Accept, Origin, Cache-Control]
+corsAllowCredentials: yes
+
+# =============================================
+# Path Templates
+# =============================================
+paths:
+  # =============================================
+  # Live Stream Paths (Real-time Broadcasting)
+  # =============================================
+  live:
+    # WebRTC support for modern browsers
+    webrtc: yes
+    # RTMP for OBS and classic encoders
+    rtmp: yes
+    # SRT for professional workflows
+    srt: yes
+    # HLS playback
+    hls: yes
+    # Authentication required
+    publishUser: ""
+    publishPass: ""
+    # Bandwidth limits (in bits per second)
+    maxPublishRate: 10000000  # 10 Mbps max ingest
+    maxReadersPerPath: 50
+    # Recording enabled for live streams
+    record: yes
+    recordPath: /var/lib/mediamtx/recordings/live/%path/%Y-%m-%d_%H-%M-%S-%f
+    # Path override for sub-paths
+    source: publisher
+
+  # =============================================
+  # Panel Stream Paths (20-Guest Panel Feature)
+  # =============================================
+  panel:
+    # Enable all protocols for panel participants
+    webrtc: yes
+    rtmp: yes
+    srt: yes
+    hls: yes
+    # Higher connection limits for panels
+    maxReadersPerPath: 100
+    # Lower bandwidth per participant
+    maxPublishRate: 5000000  # 5 Mbps per participant
+    # Recording all panel sessions
+    record: yes
+    recordPath: /var/lib/mediamtx/recordings/panel/%path/%Y-%m-%d_%H-%M-%S-%f
+    source: publisher
+
+  # Panel guest specific paths (panel_1 to panel_20)
+  panel_~^(\d+)$:
+    webrtc: yes
+    rtmp: yes
+    srt: yes
+    hls: yes
+    maxReadersPerPath: 100
+    maxPublishRate: 5000000
+    record: yes
+    recordPath: /var/lib/mediamtx/recordings/panel/%path/%Y-%m-%d_%H-%M-%S-%f
+    source: publisher
+
+  # =============================================
+  # Broadcast Paths (High-Quality Streaming)
+  # =============================================
+  broadcast:
+    webrtc: yes
+    rtmp: yes
+    srt: yes
+    hls: yes
+    dash: yes
+    # Higher bandwidth for broadcast quality
+    maxPublishRate: 20000000  # 20 Mbps
+    maxReadersPerPath: 1000
+    # Extended recording for broadcasts
+    record: yes
+    recordPath: /var/lib/mediamtx/recordings/broadcast/%path/%Y-%m-%d_%H-%M-%S-%f
+    recordSegmentDuration: 2h
+    source: publisher
+
+  # =============================================
+  # Chat Overlay Paths (Lower Bandwidth)
+  # =============================================
+  chat:
+    webrtc: yes
+    rtmp: yes
+    hls: yes
+    # Lower bandwidth for chat/streaming hybrid
+    maxPublishRate: 3000000  # 3 Mbps
+    maxReadersPerPath: 50
+    record: yes
+    recordPath: /var/lib/mediamtx/recordings/chat/%path/%Y-%m-%d_%H-%M-%S-%f
+    source: publisher
+
+  # =============================================
+  # Replay/Recording Playback Paths
+  # =============================================
+  replay:
+    # Read-only paths for playing back recordings
+    source: record
+    recordPath: /var/lib/mediamtx/recordings/%path
+    hls: yes
+    dash: yes
+    webrtc: yes
+    maxReadersPerPath: 100
+
+  # =============================================
+  # Webcam Paths (Simple WebRTC)
+  # =============================================
+  webcam:
+    webrtc: yes
+    hls: yes
+    maxPublishRate: 2000000  # 2 Mbps
+    maxReadersPerPath: 25
+    record: yes
+    recordPath: /var/lib/mediamtx/recordings/webcam/%path/%Y-%m-%d_%H-%M-%S-%f
+    source: publisher
+
+  # =============================================
+  # Screen Share Paths
+  # =============================================
+  screen:
+    webrtc: yes
+    hls: yes
+    maxPublishRate: 8000000  # 8 Mbps for screen sharing
+    maxReadersPerPath: 50
+    record: yes
+    recordPath: /var/lib/mediamtx/recordings/screen/%path/%Y-%m-%d_%H-%M-%S-%f
+    source: publisher
+
+  # =============================================
+  # Default/Fallback Path
+  # =============================================
+  "all":
+    # Catch-all configuration
+    source: publisher
+    webrtc: yes
+    rtmp: yes
+    srt: yes
+    hls: yes
+    maxPublishRate: 10000000
+    maxReadersPerPath: 50
+    record: no
+
+# =============================================
+# External Authentication Webhook
+# =============================================
+externalAuthenticationURL: ""
+
+# =============================================
+# Control Panel Paths
+# =============================================
+# These paths are used for the orchestration API
+apiPathPrefixes: [api, metrics]
+
+# =============================================
+# WebRTC ICE Configuration
+# =============================================
+webrtcICEHostNAT1To1IPs: []
+webrtcICETCPMuxAddress: ""
+
+# =============================================
+# Server Authentication
+# =============================================
+server:
+  # Internal server authentication (fallback)
+  username: ""
+  password: ""
+
+# =============================================
+# Integration Notes
+# =============================================
+# 1. Docker Compose Network Integration:
+#    - Connects to N8n at http://n8n:5678
+#    - Next.js frontend at http://frontend:3000
+#    - Shared network: cylive-network
+#
+# 2. 20-Guest Panel Feature:
+#    - Uses panel_1 to panel_20 paths
+#    - Each guest gets 5 Mbps bandwidth
+#    - Supports WebRTC for low latency
+#
+# 3. Volume Mounts Required:
+#    - /var/lib/mediamtx/recordings for persistence
+#    - /var/log/mediamtx for logs
+#
+# 4. Ports Exposed:
+#    - 1935: RTMP
+#    - 8554: RTSP
+#    - 8887: WebRTC
+#    - 8888: HLS
+#    - 8889: DASH
+#    - 8890: SRT
+#    - 9997: API
+#    - 9998: Metrics
+#
+# 5. Authentication Flow:
+#    - All publish/play requests go to N8n webhook
+#    - N8n validates JWT tokens or API keys
+#    - Returns 200 for success, 401/403 for failure

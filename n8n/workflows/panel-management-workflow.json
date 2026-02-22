@@ -1,0 +1,248 @@
+{
+  "name": "CyLive Panel Management - WebRTC",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "panel",
+        "responseMode": "responseNode",
+        "httpMethod": "POST"
+      },
+      "id": "panel-webhook",
+      "name": "Panel Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "panel-endpoint"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse panel management request\nconst body = $input.first().json.body || $input.first().json;\n\nconst validActions = ['create_room', 'join_room', 'leave_room', 'kick_guest', 'mute_guest', 'unmute_guest', 'enable_video', 'disable_video', 'promote_to_host', 'get_room_state'];\nconst action = body.action;\n\nif (!validActions.includes(action)) {\n  throw new Error('Invalid panel action: ' + action);\n}\n\nreturn [{\n  json: {\n    action: action,\n    roomId: body.roomId || crypto.randomUUID(),\n    userId: body.userId,\n    streamId: body.streamId,\n    targetUserId: body.targetUserId,\n    displayName: body.displayName,\n    maxGuests: Math.min(body.maxGuests || 20, 20),\n    rtcConfig: body.rtcConfig || {\n      iceServers: [\n        { urls: 'stun:stun.l.google.com:19302' },\n        { urls: 'stun:stun1.l.google.com:19302' }\n      ]\n    },\n    timestamp: new Date().toISOString(),\n    requestId: crypto.randomUUID()\n  }\n}];"
+      },
+      "id": "parse-panel",
+      "name": "Parse Panel Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "={{ 'panel:room:' + $json.roomId }}"
+      },
+      "id": "get-room",
+      "name": "Get Room State",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "room-exists",
+              "leftValue": "={{ $json.action }}",
+              "rightValue": "create_room",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "action-router",
+      "name": "Action Router",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Create new WebRTC room\nconst request = $input.first().json;\n\nconst room = {\n  id: request.roomId,\n  streamId: request.streamId,\n  hostId: request.userId,\n  createdAt: new Date().toISOString(),\n  maxGuests: request.maxGuests,\n  guests: [],\n  state: 'active',\n  rtcConfig: request.rtcConfig,\n  settings: {\n    videoEnabled: true,\n    audioEnabled: true,\n    screenShareEnabled: true,\n    chatEnabled: true,\n    recordingEnabled: false\n  }\n};\n\nreturn [{\n  json: {\n    ...request,\n    room: room,\n    isNewRoom: true\n  }\n}];"
+      },
+      "id": "create-room",
+      "name": "Create Room",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1050, 100]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Handle room operations\nconst request = $input.first().json;\nlet existingRoom = $input.first().json.existingRoom;\n\ntry {\n  existingRoom = typeof existingRoom === 'string' ? JSON.parse(existingRoom) : existingRoom;\n} catch (e) {\n  // Room doesn't exist\n  return [{\n    json: {\n      ...request,\n      error: 'Room not found',\n      errorCode: 'ROOM_NOT_FOUND'\n    }\n  }];\n}\n\nif (!existingRoom) {\n  return [{\n    json: {\n      ...request,\n      error: 'Room not found',\n      errorCode: 'ROOM_NOT_FOUND'\n    }\n  }];\n}\n\nlet room = { ...existingRoom };\nlet guest = null;\n\nswitch (request.action) {\n  case 'join_room':\n    if (room.guests.length >= room.maxGuests) {\n      return [{\n        json: {\n          ...request,\n          room: room,\n          error: 'Room is full',\n          errorCode: 'ROOM_FULL'\n        }\n      }];\n    }\n    guest = {\n      userId: request.userId,\n      displayName: request.displayName,\n      joinedAt: new Date().toISOString(),\n      role: 'guest',\n      videoEnabled: true,\n      audioEnabled: true,\n      isSpeaking: false,\n      connectionQuality: 'good'\n    };\n    room.guests.push(guest);\n    break;\n    \n  case 'leave_room':\n    room.guests = room.guests.filter(g => g.userId !== request.userId);\n    if (room.hostId === request.userId && room.guests.length > 0) {\n      // Transfer host to first guest\n      room.hostId = room.guests[0].userId;\n      room.guests[0].role = 'host';\n    }\n    break;\n    \n  case 'kick_guest':\n    if (room.hostId !== request.userId) {\n      return [{\n        json: {\n          ...request,\n          room: room,\n          error: 'Only host can kick guests',\n          errorCode: 'PERMISSION_DENIED'\n        }\n      }];\n    }\n    room.guests = room.guests.filter(g => g.userId !== request.targetUserId);\n    break;\n    \n  case 'mute_guest':\n  case 'unmute_guest':\n    guest = room.guests.find(g => g.userId === request.targetUserId);\n    if (guest) {\n      guest.audioEnabled = request.action === 'unmute_guest';\n    }\n    break;\n    \n  case 'enable_video':\n  case 'disable_video':\n    guest = room.guests.find(g => g.userId === request.userId);\n    if (guest) {\n      guest.videoEnabled = request.action === 'enable_video';\n    }\n    break;\n    \n  case 'promote_to_host':\n    if (room.hostId !== request.userId) {\n      return [{\n        json: {\n          ...request,\n          room: room,\n          error: 'Only host can promote guests',\n          errorCode: 'PERMISSION_DENIED'\n        }\n      }];\n    }\n    const currentHost = room.guests.find(g => g.userId === room.hostId);\n    if (currentHost) currentHost.role = 'guest';\n    \n    const newHost = room.guests.find(g => g.userId === request.targetUserId);\n    if (newHost) {\n      newHost.role = 'host';\n      room.hostId = request.targetUserId;\n    }\n    break;\n}\n\nreturn [{\n  json: {\n    ...request,\n    room: room,\n    isNewRoom: false\n  }\n}];"
+      },
+      "id": "handle-operations",
+      "name": "Handle Room Operations",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1050, 500]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "={{ 'panel:room:' + $json.roomId }}",
+        "value": "={{ JSON.stringify($json.room) }}",
+        "expire": true,
+        "ttl": 7200
+      },
+      "id": "store-room",
+      "name": "Store Room State",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1250, 300],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "panel_rooms",
+        "columns": "room_id, stream_id, host_id, max_guests, guest_count, state, created_at, updated_at",
+        "values": "={{ $json.room.id }}, {{ $json.room.streamId }}, {{ $json.room.hostId }}, {{ $json.room.maxGuests }}, {{ $json.room.guests.length }}, {{ $json.room.state }}, {{ $json.room.createdAt }}, {{ new Date().toISOString() }}",
+        "options": {
+          "ignoreOnConflict": true
+        }
+      },
+      "id": "persist-room",
+      "name": "Persist Room to DB",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1250, 100],
+      "credentials": {
+        "postgres": "cylive-postgres-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Log panel activity\nconst data = $input.first().json;\nconst activities = data.room.guests.map(guest => ({\n  roomId: data.room.id,\n  userId: guest.userId,\n  action: data.action,\n  timestamp: new Date().toISOString()\n}));\n\nreturn activities;"
+      },
+      "id": "prepare-activity-log",
+      "name": "Prepare Activity Log",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1450, 500]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "panel_activity_logs",
+        "columns": "room_id, user_id, action, metadata, created_at",
+        "values": "={{ $json.roomId }}, {{ $json.userId }}, {{ $json.action }}, {{ JSON.stringify({guestCount: $json.room.guests.length}) }}, {{ $json.timestamp }}"
+      },
+      "id": "log-activity",
+      "name": "Log Activity",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1450, 100],
+      "credentials": {
+        "postgres": "cylive-postgres-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "publish",
+        "channel": "={{ 'panel:room:' + $json.roomId + ':events' }}",
+        "message": "={{ JSON.stringify({\n  type: 'room_update',\n  action: $json.action,\n  roomId: $json.roomId,\n  userId: $json.userId,\n  targetUserId: $json.targetUserId,\n  room: {\n    id: $json.room.id,\n    hostId: $json.room.hostId,\n    guestCount: $json.room.guests.length,\n    maxGuests: $json.room.maxGuests,\n    guests: $json.room.guests.map(g => ({\n      userId: g.userId,\n      displayName: g.displayName,\n      role: g.role,\n      videoEnabled: g.videoEnabled,\n      audioEnabled: g.audioEnabled\n    }))\n  },\n  timestamp: Date.now()\n}) }}"
+      },
+      "id": "broadcast-update",
+      "name": "Broadcast Room Update",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1650, 300],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.error ? {\n  \"success\": false,\n  \"error\": $json.error,\n  \"errorCode\": $json.errorCode\n} : {\n  \"success\": true,\n  \"data\": {\n    \"requestId\": $json.requestId,\n    \"action\": $json.action,\n    \"room\": {\n      \"id\": $json.room.id,\n      \"streamId\": $json.room.streamId,\n      \"hostId\": $json.room.hostId,\n      \"guestCount\": $json.room.guests.length,\n      \"maxGuests\": $json.room.maxGuests,\n      \"state\": $json.room.state,\n      \"guests\": $json.room.guests.map(g => ({\n        userId: g.userId,\n        displayName: g.displayName,\n        role: g.role,\n        videoEnabled: g.videoEnabled,\n        audioEnabled: g.audioEnabled,\n        connectionQuality: g.connectionQuality\n      })),\n      \"rtcConfig\": $json.room.rtcConfig\n    }\n  }\n}) }}"
+      },
+      "id": "panel-response",
+      "name": "Panel Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1850, 300]
+    }
+  ],
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "error-handler-workflow"
+  },
+  "tags": ["webrtc", "panel", "video", "conference"],
+  "connections": {
+    "Panel Webhook": {
+      "main": [[{"node": "Parse Panel Request", "type": "main", "index": 0}]]
+    },
+    "Parse Panel Request": {
+      "main": [[{"node": "Get Room State", "type": "main", "index": 0}]]
+    },
+    "Get Room State": {
+      "main": [[{"node": "Action Router", "type": "main", "index": 0}]]
+    },
+    "Action Router": {
+      "main": [
+        [{"node": "Create Room", "type": "main", "index": 0}],
+        [{"node": "Handle Room Operations", "type": "main", "index": 0}]
+      ]
+    },
+    "Create Room": {
+      "main": [[{"node": "Store Room State", "type": "main", "index": 0}]]
+    },
+    "Handle Room Operations": {
+      "main": [[{"node": "Store Room State", "type": "main", "index": 0}]]
+    },
+    "Store Room State": {
+      "main": [
+        [{"node": "Persist Room to DB", "type": "main", "index": 0}],
+        [{"node": "Broadcast Room Update", "type": "main", "index": 0}]
+      ]
+    },
+    "Persist Room to DB": {
+      "main": [[{"node": "Log Activity", "type": "main", "index": 0}]]
+    },
+    "Broadcast Room Update": {
+      "main": [[{"node": "Panel Response", "type": "main", "index": 0}]]
+    }
+  },
+  "mcpTools": {
+    "manage_panel": {
+      "name": "cylive_manage_panel",
+      "description": "Manage WebRTC panel rooms with up to 20 guests",
+      "parameters": {
+        "action": { "type": "string", "enum": ["create_room", "join_room", "leave_room", "kick_guest", "mute_guest", "unmute_guest", "enable_video", "disable_video", "promote_to_host", "get_room_state"], "required": true },
+        "roomId": { "type": "string" },
+        "userId": { "type": "string", "required": true },
+        "streamId": { "type": "string" },
+        "targetUserId": { "type": "string", "description": "User ID for kick/mute/promote operations" },
+        "displayName": { "type": "string" },
+        "maxGuests": { "type": "number", "minimum": 1, "maximum": 20, "default": 20 }
+      },
+      "returns": {
+        "room": "object",
+        "guestCount": "number",
+        "guests": "array"
+      }
+    },
+    "get_panel_state": {
+      "name": "cylive_get_panel_state",
+      "description": "Get current panel room state",
+      "parameters": {
+        "roomId": { "type": "string", "required": true }
+      }
+    }
+  },
+  "createdAt": "2026-02-11T00:00:00.000Z",
+  "updatedAt": "2026-02-11T00:00:00.000Z"
+}

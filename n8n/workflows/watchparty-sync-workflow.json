@@ -1,0 +1,259 @@
+{
+  "name": "CyLive Watch Party Sync",
+  "nodes": [
+    {
+      "parameters": {
+        "path": "watchparty-sync",
+        "responseMode": "responseNode",
+        "httpMethod": "POST"
+      },
+      "id": "sync-webhook",
+      "name": "Sync Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [250, 300],
+      "webhookId": "watchparty-sync-endpoint"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse sync request\nconst body = $input.first().json.body || $input.first().json;\n\nconst validActions = ['sync', 'join', 'leave', 'seek', 'play', 'pause', 'buffer'];\nconst action = body.action;\n\nif (!validActions.includes(action)) {\n  throw new Error('Invalid sync action');\n}\n\nreturn [{\n  json: {\n    action: action,\n    partyId: body.partyId,\n    userId: body.userId,\n    streamId: body.streamId,\n    timestamp: body.timestamp || Date.now(),\n    videoTime: body.videoTime || 0,\n    playbackRate: body.playbackRate || 1.0,\n    bufferHealth: body.bufferHealth || 100,\n    clientTime: body.clientTime || Date.now(),\n    serverTime: Date.now(),\n    syncId: crypto.randomUUID()\n  }\n}];"
+      },
+      "id": "parse-sync",
+      "name": "Parse Sync Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [450, 300]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "key": "={{ 'watchparty:' + $json.partyId + ':master_clock' }}"
+      },
+      "id": "get-master-clock",
+      "name": "Get Master Clock",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [650, 300],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "master-exists",
+              "leftValue": "={{ $json !== null && $json !== undefined }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "master-check",
+      "name": "Master Clock Check",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [850, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Initialize new master clock\nconst syncData = $input.first().json;\n\nconst masterClock = {\n  partyId: syncData.partyId,\n  streamId: syncData.streamId,\n  masterUserId: syncData.userId,\n  startTime: Date.now(),\n  videoTime: syncData.videoTime,\n  state: 'playing',\n  playbackRate: syncData.playbackRate || 1.0,\n  lastUpdate: Date.now(),\n  participantCount: 1,\n  maxDrift: 0,\n  syncQuality: 100\n};\n\nreturn [{\n  json: {\n    ...syncData,\n    masterClock: masterClock,\n    isNewMaster: true\n  }\n}];"
+      },
+      "id": "init-master",
+      "name": "Initialize Master Clock",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1050, 100]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "={{ 'watchparty:' + $json.partyId + ':master_clock' }}",
+        "value": "={{ JSON.stringify($json.masterClock) }}",
+        "expire": true,
+        "ttl": 3600
+      },
+      "id": "store-master",
+      "name": "Store Master Clock",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1250, 100],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Calculate drift and sync offset\nconst syncData = $input.first().json;\nconst existingMaster = $input.first().json.existingMaster;\n\n// Parse existing master clock\nlet masterClock;\ntry {\n  masterClock = typeof existingMaster === 'string' ? JSON.parse(existingMaster) : existingMaster;\n} catch (e) {\n  masterClock = existingMaster;\n}\n\n// Calculate network latency (round-trip time / 2)\nconst networkLatency = (syncData.serverTime - syncData.clientTime) / 2;\n\n// Calculate client drift from master\nconst elapsedSinceMasterUpdate = Date.now() - masterClock.lastUpdate;\nconst expectedVideoTime = masterClock.videoTime + (masterClock.state === 'playing' ? elapsedSinceMasterUpdate / 1000 * masterClock.playbackRate : 0);\nconst clientVideoTime = syncData.videoTime + (networkLatency / 1000);\nconst drift = Math.abs(expectedVideoTime - clientVideoTime) * 1000; // in ms\n\n// Update master clock with new stats\nmasterClock.participantCount = (masterClock.participantCount || 0) + (syncData.action === 'join' ? 1 : syncData.action === 'leave' ? -1 : 0);\nmasterClock.maxDrift = Math.max(masterClock.maxDrift || 0, drift);\nmasterClock.lastUpdate = Date.now();\n\n// Calculate sync quality (100 - drift in percentage, capped at 0)\nconst syncQuality = Math.max(0, 100 - (drift / 10));\nmasterClock.syncQuality = Math.round((masterClock.syncQuality * 0.9) + (syncQuality * 0.1)); // Moving average\n\nreturn [{\n  json: {\n    ...syncData,\n    masterClock: masterClock,\n    drift: drift,\n    networkLatency: networkLatency,\n    expectedVideoTime: expectedVideoTime,\n    syncOffset: expectedVideoTime - clientVideoTime,\n    isNewMaster: false\n  }\n}];"
+      },
+      "id": "calculate-drift",
+      "name": "Calculate Drift & Offset",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1050, 400]
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "={{ 'watchparty:' + $json.partyId + ':master_clock' }}",
+        "value": "={{ JSON.stringify($json.masterClock) }}",
+        "expire": true,
+        "ttl": 3600
+      },
+      "id": "update-master",
+      "name": "Update Master Clock",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1250, 400],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "set",
+        "key": "={{ 'watchparty:' + $json.partyId + ':participant:' + $json.userId }}",
+        "value": "={{ JSON.stringify({\n  userId: $json.userId,\n  joinedAt: new Date().toISOString(),\n  lastSync: Date.now(),\n  drift: $json.drift || 0,\n  bufferHealth: $json.bufferHealth || 100,\n  state: $json.action\n}) }}",
+        "expire": true,
+        "ttl": 300
+      },
+      "id": "track-participant",
+      "name": "Track Participant",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1450, 300],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "publish",
+        "channel": "={{ 'watchparty:' + $json.partyId + ':sync' }}",
+        "message": "={{ JSON.stringify({\n  type: 'sync_update',\n  partyId: $json.partyId,\n  syncId: $json.syncId,\n  action: $json.action,\n  masterClock: $json.masterClock,\n  targetVideoTime: $json.expectedVideoTime || $json.videoTime,\n  syncOffset: $json.syncOffset || 0,\n  drift: $json.drift || 0,\n  networkLatency: $json.networkLatency || 0,\n  timestamp: Date.now(),\n  participants: $json.masterClock.participantCount\n}) }}"
+      },
+      "id": "broadcast-sync",
+      "name": "Broadcast Sync Update",
+      "type": "n8n-nodes-base.redis",
+      "typeVersion": 1,
+      "position": [1650, 300],
+      "credentials": {
+        "redis": "cylive-redis-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "watchparty_sync_logs",
+        "columns": "sync_id, party_id, user_id, stream_id, action, drift_ms, network_latency_ms, video_time, sync_quality, participant_count, created_at",
+        "values": "={{ $json.syncId }}, {{ $json.partyId }}, {{ $json.userId }}, {{ $json.streamId }}, {{ $json.action }}, {{ $json.drift || 0 }}, {{ $json.networkLatency || 0 }}, {{ $json.videoTime }}, {{ $json.masterClock.syncQuality }}, {{ $json.masterClock.participantCount }}, {{ new Date().toISOString() }}"
+      },
+      "id": "log-sync",
+      "name": "Log Sync Event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [1650, 100],
+      "credentials": {
+        "postgres": "cylive-postgres-credentials"
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({\n  \"success\": true,\n  \"data\": {\n    \"syncId\": $json.syncId,\n    \"partyId\": $json.partyId,\n    \"action\": $json.action,\n    \"masterClock\": {\n      \"videoTime\": $json.masterClock.videoTime,\n      \"state\": $json.masterClock.state,\n      \"playbackRate\": $json.masterClock.playbackRate,\n      \"syncQuality\": $json.masterClock.syncQuality\n    },\n    \"syncOffset\": $json.syncOffset || 0,\n    \"drift\": $json.drift || 0,\n    \"networkLatency\": $json.networkLatency || 0,\n    \"participants\": $json.masterClock.participantCount,\n    \"serverTime\": Date.now(),\n    \"isMaster\": $json.isNewMaster || false\n  }\n}) }}"
+      },
+      "id": "sync-response",
+      "name": "Sync Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1850, 300]
+    }
+  ],
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "error-handler-workflow"
+  },
+  "tags": ["watchparty", "sync", "redis", "real-time"],
+  "connections": {
+    "Sync Webhook": {
+      "main": [[{"node": "Parse Sync Request", "type": "main", "index": 0}]]
+    },
+    "Parse Sync Request": {
+      "main": [[{"node": "Get Master Clock", "type": "main", "index": 0}]]
+    },
+    "Get Master Clock": {
+      "main": [[{"node": "Master Clock Check", "type": "main", "index": 0}]]
+    },
+    "Master Clock Check": {
+      "main": [
+        [{"node": "Initialize Master Clock", "type": "main", "index": 0}],
+        [{"node": "Calculate Drift & Offset", "type": "main", "index": 0}]
+      ]
+    },
+    "Initialize Master Clock": {
+      "main": [[{"node": "Store Master Clock", "type": "main", "index": 0}]]
+    },
+    "Store Master Clock": {
+      "main": [[{"node": "Track Participant", "type": "main", "index": 0}]]
+    },
+    "Calculate Drift & Offset": {
+      "main": [[{"node": "Update Master Clock", "type": "main", "index": 0}]]
+    },
+    "Update Master Clock": {
+      "main": [[{"node": "Track Participant", "type": "main", "index": 0}]]
+    },
+    "Track Participant": {
+      "main": [
+        [{"node": "Broadcast Sync Update", "type": "main", "index": 0}],
+        [{"node": "Log Sync Event", "type": "main", "index": 0}]
+      ]
+    },
+    "Broadcast Sync Update": {
+      "main": [[{"node": "Sync Response", "type": "main", "index": 0}]]
+    }
+  },
+  "mcpTools": {
+    "sync_watchparty": {
+      "name": "cylive_sync_watchparty",
+      "description": "Synchronize watch party video playback across all participants",
+      "parameters": {
+        "action": { "type": "string", "enum": ["sync", "join", "leave", "seek", "play", "pause", "buffer"], "required": true },
+        "partyId": { "type": "string", "required": true },
+        "userId": { "type": "string", "required": true },
+        "streamId": { "type": "string" },
+        "videoTime": { "type": "number", "description": "Current video playback time in seconds" },
+        "playbackRate": { "type": "number", "default": 1.0 },
+        "bufferHealth": { "type": "number", "description": "Buffer health percentage" },
+        "clientTime": { "type": "number", "description": "Client timestamp for latency calculation" }
+      },
+      "returns": {
+        "syncId": "string",
+        "syncOffset": "number",
+        "drift": "number",
+        "networkLatency": "number",
+        "participants": "number"
+      }
+    },
+    "get_watchparty_status": {
+      "name": "cylive_get_watchparty_status",
+      "description": "Get current watch party synchronization status",
+      "parameters": {
+        "partyId": { "type": "string", "required": true }
+      }
+    }
+  },
+  "createdAt": "2026-02-11T00:00:00.000Z",
+  "updatedAt": "2026-02-11T00:00:00.000Z"
+}
